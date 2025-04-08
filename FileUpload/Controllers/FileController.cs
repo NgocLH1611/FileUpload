@@ -2,6 +2,7 @@
 using FileUpload.Entities;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Threading.Tasks;
 
 namespace FileUpload.Controllers
 {
@@ -69,6 +70,54 @@ namespace FileUpload.Controllers
             }
 
             return Ok(files);
+        }
+
+        [HttpGet("download/{taskId}/{fileid}")]
+        public async Task<IActionResult> DownloadFile(int fileid, int taskId)
+        {
+            var taskFile = await _context.TaskFiles.FirstOrDefaultAsync(f => f.Id == fileid);
+
+            if (taskFile == null)
+            {
+                return NotFound("File not found!");
+            }
+
+            var filePath = Path.Combine(_env.ContentRootPath, "Uploads", $"Task_{taskId}", taskFile.FileName);
+
+            if (!System.IO.File.Exists(filePath))
+            {
+                return NotFound("File does not exist in the server!");
+            }
+
+            var fileBytes = await System.IO.File.ReadAllBytesAsync(filePath);
+            return File(fileBytes, "application/octet-stream", taskFile.FileName);
+        }
+
+        [HttpDelete("{fileid}")]
+        public async Task<IActionResult> DeleteFile(int fileid, int taskid)
+        {
+            var file = await _context.TaskFiles.FirstOrDefaultAsync(f => f.Id == fileid);
+
+            if (file == null)
+            {
+                return NotFound("File not found!");
+            }
+
+            var filePath = Path.Combine(_env.ContentRootPath, "Uploads", $"Task_{taskid}", file.FileName);
+
+            if (!System.IO.File.Exists(filePath))
+            {
+                return NotFound("File does not exist in the server!");
+            }
+            else
+            {
+                System.IO.File.Delete(filePath);
+            }
+
+            _context.TaskFiles.Remove(file);
+            await _context.SaveChangesAsync();
+
+            return Ok($"Delete {file.FileName} successfully!");
         }
     }
 }
