@@ -16,10 +16,10 @@ builder.Services.AddScoped<IUploadHandler, UploadHandler>();
 
 builder.Services.AddDbContext<ApplicationDbContext>(options => options.UseSqlServer(builder.Configuration.GetConnectionString("DefaultConnection")));
 
-FirebaseApp.Create(new AppOptions()
-{
-    Credential = GoogleCredential.FromFile("fireupload-demo-firebase-adminsdk-fbsvc-b814e6be97.json"),
-});
+//FirebaseApp.Create(new AppOptions()
+//{
+//    Credential = GoogleCredential.FromFile("fireupload-demo-firebase-adminsdk-fbsvc-b814e6be97.json"),
+//});
 
 var app = builder.Build();
 
