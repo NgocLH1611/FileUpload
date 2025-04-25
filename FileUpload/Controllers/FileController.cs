@@ -1,10 +1,12 @@
 ﻿using FileUpload.Data;
 using FileUpload.Entities;
+using FileUpload.Helper;
 using Google.Apis.Auth.OAuth2;
+using Google.Cloud.Storage.V1;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
-using System.Net.Http.Headers;
-using System.Threading.Tasks;
+using Microsoft.Extensions.Options;
+using System.Linq;
 
 namespace FileUpload.Controllers
 {
@@ -14,10 +16,24 @@ namespace FileUpload.Controllers
     {
         private readonly IWebHostEnvironment _env;
         private readonly ApplicationDbContext _context;
-        public FileController(IWebHostEnvironment env, ApplicationDbContext context)
+        private readonly FirebaseConfig _config;
+        private readonly ISignedUrl _signedUrl;
+        private readonly string bucketName;
+        private readonly string credentialPath;
+        private readonly StorageClient storageClient;
+        private readonly GoogleCredential credential;
+
+        public FileController(IWebHostEnvironment env, ApplicationDbContext context, IOptions<FirebaseConfig> config, ISignedUrl signedUrl)
         {
             _env = env;
             _context = context;
+            _config = config.Value;
+            _signedUrl = signedUrl;
+
+            bucketName = _config.BucketName;
+            credentialPath = Path.Combine(_env.ContentRootPath, "Firebase", _config.ServiceAccountPath);
+            credential = GoogleCredential.FromFile(credentialPath);
+            storageClient = StorageClient.Create(credential);
         }
 
         [HttpPost("{taskId}/upload")]
@@ -27,130 +43,90 @@ namespace FileUpload.Controllers
             string extension = Path.GetExtension(file.FileName);
             if (!validExtensions.Contains(extension))
             {
-                return BadRequest("The file format is invalid. The file format must be: " + validExtensions);
+                return BadRequest("The file format is invalid. The file format must be: " + string.Join(", ", validExtensions));
             }
 
             long size = file.Length;
             if (size > (5 * 1024 * 1024))
-                return BadRequest();
+                return BadRequest("File too large. Max 5MB.");
 
             string fileName = Guid.NewGuid().ToString() + extension;
             string taskFolder = Path.Combine(_env.ContentRootPath, "Uploads", $"Task_{taskId}");
 
             if (!Directory.Exists(taskFolder))
-            {
                 Directory.CreateDirectory(taskFolder);
-            }
 
-            string fullPath = Path.Combine(taskFolder, fileName);
-            using (FileStream stream = new FileStream(fullPath, FileMode.Create))
+            string localPath = Path.Combine(taskFolder, fileName);
+            using (FileStream stream = new FileStream(localPath, FileMode.Create))
             {
                 await file.CopyToAsync(stream);
             }
 
-            string firebasePath = $"uploads/task_{taskId}/{fileName}";
-            string bucketName = "fireupload-demo.appspot.com";
-            string serviceAccountPath = Path.Combine(_env.ContentRootPath, "Firebase", "firebase-key.json");
+            string firebasePath = $"tasks/{taskId}/{fileName}";
 
-            var credential = GoogleCredential
-                .FromFile(serviceAccountPath)
-                .CreateScoped("https://www.googleapis.com/auth/devstorage.full_control");
-
-            string accessToken = await credential.UnderlyingCredential.GetAccessTokenForRequestAsync();
-
-            var escapedPath = Uri.EscapeDataString(firebasePath);
-            var uploadUrl = $"https://storage.googleapis.com/upload/storage/v1/b/{bucketName}/o?uploadType=media&name={escapedPath}";
-
-            using var httpClient = new HttpClient();
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", accessToken);
-
-            using var firebaseStream = new FileStream(fullPath, FileMode.Open);
-            var content = new StreamContent(firebaseStream);
-            content.Headers.ContentType = new MediaTypeHeaderValue(file.ContentType);
-
-            var response = await httpClient.PostAsync(uploadUrl, content);
-            if (!response.IsSuccessStatusCode)
+            using (var fileStream = new FileStream(localPath, FileMode.Open))
             {
-                var errorText = await response.Content.ReadAsStringAsync();
-                return StatusCode((int)response.StatusCode, $"Failed to upload data to Firebase! {errorText}");
+                var uploadObject = storageClient.UploadObject(bucketName, firebasePath, file.ContentType, fileStream);
+                fileStream.Close();
             }
-
-            string downloadUrl = $"https://storage.googleapis.com/v0/b/{bucketName}/o/{Uri.EscapeDataString(firebasePath)}?alt=media";
 
             var taskFile = new TaskFile
             {
                 TaskId = taskId,
                 FileName = fileName,
-                FilePath = fullPath,
-                FirebasePath = firebasePath,
-                DownloadUrl = downloadUrl
+                FilePath = localPath,
+                FirebasePath = firebasePath
             };
 
             await _context.TaskFiles.AddAsync(taskFile);
             await _context.SaveChangesAsync();
-            
-            return Ok(new { fileName, fullPath, firebasePath, downloadUrl });
+
+            return Ok(new
+            {
+                fileName,
+                localPath,
+                firebasePath = $"gs://{bucketName}/{firebasePath}"
+            });
         }
 
         [HttpGet("{taskId}")]
-        public IActionResult GetFiles(int taskId)
+        public async Task<IActionResult> GetFiles(int taskId)
         {
-            var files = _context.TaskFiles.Where(f => f.TaskId == taskId).Select(f => new { f.Id, f.FileName, f.FilePath }).ToList();
+            string firebasePath = $"tasks/{taskId}/";
 
-            if (!files.Any())
+            var files = new List<string>();
+
+            await foreach (var obj in storageClient.ListObjectsAsync(bucketName, firebasePath))
             {
-                return NotFound("There is no files uploaded.");
+                files.Add(Path.GetFileName(obj.Name));
             }
 
             return Ok(files);
         }
 
-        [HttpGet("download/{taskId}/{fileid}")]
-        public async Task<IActionResult> DownloadFile(int fileid, int taskId)
+        [HttpGet("download/{taskId}/{fileName}")]
+        public IActionResult GetDownloadUrl(int taskId, string fileName)
         {
-            var taskFile = await _context.TaskFiles.FirstOrDefaultAsync(f => f.Id == fileid);
-
-            if (taskFile == null)
-            {
-                return NotFound("File not found!");
-            }
-
-            var filePath = Path.Combine(_env.ContentRootPath, "Uploads", $"Task_{taskId}", taskFile.FileName);
-
-            if (!System.IO.File.Exists(filePath))
-            {
-                return NotFound("File does not exist in the server!");
-            }
-
-            var fileBytes = await System.IO.File.ReadAllBytesAsync(filePath);
-            return File(fileBytes, "application/octet-stream", taskFile.FileName);
+            string firebasePath = $"tasks/{taskId}/{fileName}";
+            var url = _signedUrl.CreateSignedUrl(firebasePath, _config.ExpireTimer);
+            return Ok(new { url });
         }
 
-        [HttpDelete("{fileid}")]
-        public async Task<IActionResult> DeleteFile(int fileid, int taskid)
+        [HttpDelete("{taskId}/{fileName}")]
+        public async Task<IActionResult> DeleteFile(int taskId, string fileName)
         {
-            var file = await _context.TaskFiles.FirstOrDefaultAsync(f => f.Id == fileid);
+            string firebasePath = $"tasks/{taskId}/{fileName}";
 
-            if (file == null)
+            try
             {
-                return NotFound("File not found!");
+                await storageClient.DeleteObjectAsync(bucketName, firebasePath);
+            }
+            catch (Google.GoogleApiException ex) when (ex.HttpStatusCode == System.Net.HttpStatusCode.NotFound)
+            {
+                return NotFound("File not found in Firebase Storage");
             }
 
-            var filePath = Path.Combine(_env.ContentRootPath, "Uploads", $"Task_{taskid}", file.FileName);
-
-            if (!System.IO.File.Exists(filePath))
-            {
-                return NotFound("File does not exist in the server!");
-            }
-            else
-            {
-                System.IO.File.Delete(filePath);
-            }
-
-            _context.TaskFiles.Remove(file);
-            await _context.SaveChangesAsync();
-
-            return Ok($"Delete {file.FileName} successfully!");
+            return Ok($"File {fileName} was successfully delete from Firebase Storage!");
         }
     }
 }

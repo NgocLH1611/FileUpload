@@ -1,0 +1,6 @@
+services:
+  fileupload:
+    image: ${DOCKER_REGISTRY-}fileupload
+    build:
+      context: .
+      dockerfile: FileUpload/Dockerfile
